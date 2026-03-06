@@ -38,6 +38,7 @@ const (
 type AgentConfig struct {
 	BasePath             string        `env:"AGENT_BASE_PATH" envDefault:"./storage"`
 	ListenAddr           string        `env:"AGENT_LISTEN_ADDR" envDefault:":8080"`
+	MetricsAddr          string        `env:"AGENT_METRICS_ADDR" envDefault:"127.0.0.1:9090"`
 	Tenants              string        `env:"AGENT_TENANTS,required"`
 	TLSCert              string        `env:"AGENT_TLS_CERT"`
 	TLSKey               string        `env:"AGENT_TLS_KEY"`
@@ -47,6 +48,8 @@ type AgentConfig struct {
 	ExportfsBin          string        `env:"AGENT_EXPORTFS_BIN" envDefault:"exportfs"`
 	BtrfsBin             string        `env:"AGENT_BTRFS_BIN" envDefault:"btrfs"`
 	NFSReconcileInterval time.Duration `env:"AGENT_NFS_RECONCILE_INTERVAL" envDefault:"10m"`
+	DeviceIOInterval     time.Duration `env:"AGENT_DEVICE_IO_INTERVAL" envDefault:"5s"`
+	DeviceStatsInterval  time.Duration `env:"AGENT_DEVICE_STATS_INTERVAL" envDefault:"1m"`
 	DashboardRefresh     int           `env:"AGENT_DASHBOARD_REFRESH_SECONDS" envDefault:"5"`
 	DefaultDirMode       string        `env:"AGENT_DEFAULT_DIR_MODE" envDefault:"0700"`
 	DefaultDataMode      string        `env:"AGENT_DEFAULT_DATA_MODE" envDefault:"2770"`

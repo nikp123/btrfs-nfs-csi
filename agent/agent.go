@@ -45,7 +45,7 @@ func (a *Agent) Start(ctx context.Context) {
 
 	// unauthenticated endpoints
 	e.GET("/healthz", v1.Healthz(a.version, a.commit, features))
-	e.GET("/metrics", v1.MetricsHandler())
+	startMetricsServer(a.cfg.MetricsAddr)
 
 	// NFS exporter
 	var exp nfs.Exporter
@@ -94,7 +94,7 @@ func (a *Agent) Start(ctx context.Context) {
 	a.echo = e
 	a.ready = true
 
-	store.StartWorkers(ctx, a.cfg.UsageInterval, a.cfg.NFSReconcileInterval)
+	store.StartWorkers(ctx, a.cfg.UsageInterval, a.cfg.NFSReconcileInterval, a.cfg.DeviceIOInterval, a.cfg.DeviceStatsInterval)
 
 	go func() {
 		var err error
