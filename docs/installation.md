@@ -103,6 +103,46 @@ curl -Lo /etc/systemd/system/btrfs-nfs-csi-agent.service \
 
 To build from source: `CGO_ENABLED=0 go build -o btrfs-nfs-csi .`
 
+### 3c. NixOS
+
+This is an example working flake:
+
+```nix
+{
+  inputs = {
+    ...
+    btrfs-nfs-csi.url = "github:erikmagkekse/btrfs-nfs-csi";
+  };
+
+  outputs = {
+    nixpkgs,
+    ...,
+    btrfs-nfs-csi
+  }: {
+    nixosConfigurations."demo" = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        btrfs-nfs-csi.nixosModules.btrfs-nfs-csi
+        {
+          services.btrfs-nfs-csi.agent = {
+            enable = true;
+
+            basePath = "/export/data";
+            listenAddr = ":8080";
+
+            environmentFile = ./envfile.env;
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+WARNING: The NixOS module does not read from ``/etc/btrfs-nfs-csi``, you need to specify the configuration file as an option.
+
+To hide environment secrets from the store, I suggest using something like [sops-nix](https://github.com/Mic92/sops-nix).
+
 ### 4. Configure and Start
 
 ```bash
