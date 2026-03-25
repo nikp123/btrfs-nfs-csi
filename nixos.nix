@@ -34,6 +34,11 @@ let
         default = ":8000";
         description = "Address for the agent to listen on (AGENT_LISTEN_ADDR)";
       };
+      metricsAddr = mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1:9090";
+        description = "Metrics server address (AGENT_METRICS_ADDR)";
+      };
     };
   };
 in
@@ -66,6 +71,7 @@ in
         environment = {
           AGENT_BASE_PATH   = options.basePath;
           AGENT_LISTEN_ADDR = options.listenAddr;
+          AGENT_METRICS_ADDR = options.metricsAddr;
         };
         path = [
           pkgs.btrfs-progs
