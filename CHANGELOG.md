@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.9.9
+
+### Features
+- Sortable columns (Usage %, Clients, Created) on dashboard volume and snapshot tables (#60)
+- ReadOnlyMany (ROX) access mode support for read-only PVC mounts (#57)
+- Nix flake for package and NixOS service module, thanks to @nikp123 (#53)
+- Adding the ability to have multiple agents in the Nix module, thanks to @nikp123 (#62)
+- Improve dashboard formatting and UX (#64)
+- Simplify snapshot table view in dashboard (#65)
+
+### Bug Fixes
+- Fix read-only PVC mounts not being remounted as read-only (#57)
+- Fix NodeGetVolumeStats always failing with "agent may be down" (#63)
+
+### Refactoring
+- Unit tests for controller utils (paginate, parseVolumeID, parseNodeIP) and PVC validation (#59)
+- Unit tests for driver utils (ResolveNodeIP) (#59)
+
+### Security
+- Bump `google.golang.org/grpc` to v1.79.3 — fixes CVE-2026-33186 (authorization bypass via missing leading slash in `:path`, CVSS 9.1 Critical)
+
+### Other
+- Improved controller agent version check message on non-matching commit builds, issue #54 (#56)
+- Updated Go dependencies and CI workflow (#58)
+
+
 ## v0.9.8
 
 ### Features
