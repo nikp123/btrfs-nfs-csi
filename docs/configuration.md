@@ -4,7 +4,7 @@
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGENT_BASE_PATH` | `./storage` | btrfs mount point |
+| `AGENT_BASE_PATH` | `./storage` | btrfs mount point (quickstart sets `/export/data`) |
 | `AGENT_TENANTS` | **required** | `name:token,name:token` |
 | `AGENT_LISTEN_ADDR` | `:8080` | HTTP listen address |
 | `AGENT_METRICS_ADDR` | `127.0.0.1:9090` | Metrics server address |
@@ -16,75 +16,48 @@
 | `AGENT_EXPORTFS_BIN` | `exportfs` | exportfs binary path |
 | `AGENT_KERNEL_EXPORT_OPTIONS` | `rw,nohide,crossmnt,no_root_squash,no_subtree_check` | NFS export options (fsid is always appended automatically) |
 | `AGENT_BTRFS_BIN` | `btrfs` | btrfs binary path |
-| `AGENT_NFS_RECONCILE_INTERVAL` | `10m` | Export reconciliation (`0` = off) |
+| `AGENT_NFS_RECONCILE_INTERVAL` | `60s` | Export reconciliation (`0` = off) |
 | `AGENT_DEVICE_IO_INTERVAL` | `5s` | Device IO stats update interval |
 | `AGENT_DEVICE_STATS_INTERVAL` | `1m` | btrfs device errors + filesystem usage update interval |
-| `AGENT_DASHBOARD_REFRESH_SECONDS` | `5` | Dashboard refresh |
 | `AGENT_DEFAULT_DIR_MODE` | `0700` | Default mode for volume/snapshot/clone directories |
 | `AGENT_DEFAULT_DATA_MODE` | `2770` | Default mode for data subvolumes (setgid + group rwx) |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `AGENT_TASK_CLEANUP_INTERVAL` | `24h` | Remove completed/failed tasks after this duration |
+| `AGENT_TASK_MAX_CONCURRENT` | `2` | Max concurrent tasks (`0` = unlimited) |
+| `AGENT_TASK_DEFAULT_TIMEOUT` | `6h` | Default timeout for tasks (e.g. test). `0` = no timeout |
+| `AGENT_TASK_SCRUB_TIMEOUT` | `24h` | Timeout for btrfs scrub tasks. `0` = no timeout |
+| `AGENT_TASK_POLL_INTERVAL` | `5s` | Progress update interval for background tasks |
+| `AGENT_IMMUTABLE_LABELS` | - | Comma-separated label keys that cannot be changed after creation |
+| `AGENT_DEFAULT_PAGE_LIMIT` | `0` | Default page size for list API responses (0 = pagination disabled) |
+| `AGENT_API_PAGINATION_SNAPSHOT_TTL` | `30s` | TTL for cursor-based pagination snapshots |
+| `AGENT_API_PAGINATION_MAX_SNAPSHOTS` | `100` | Max concurrent pagination snapshots |
+| `AGENT_API_SWAGGER_ENABLED` | `false` | Enable `GET /swagger.json` endpoint |
+| `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 
-## Controller Environment Variables
+## API Client Environment Variables
+
+Shared by CLI and all integrations (any `v1.Client` user).
 
 | Variable | Default | Description |
 |---|---|---|
-| `DRIVER_ENDPOINT` | `unix:///csi/csi.sock` | gRPC socket |
-| `DRIVER_METRICS_ADDR` | `:9090` | Metrics address |
+| `AGENT_CSI_IDENTITY` | `cli` (CLI), `k8s` (controller) | Caller identity for `created-by` label, injected automatically on every create |
+| `AGENT_HTTP_CLIENT_TIMEOUT` | `30s` | API request timeout (Go duration) |
+| `AGENT_HTTP_CLIENT_TLS_SKIP_VERIFY` | `false` | Skip TLS certificate verification |
+| `AGENT_HTTP_CLIENT_PAGE_LIMIT` | `0` | Items per page for auto-pagination (0 = pagination disabled) |
+| `AGENT_HTTP_CLIENT_PREFETCH` | `8` | Max pages to prefetch concurrently (`0` = sequential) |
+| `AGENT_HTTP_CLIENT_PREFETCH_MB` | `4` | Prefetch byte budget in MB (`0` = unlimited) |
 
-## Node Environment Variables
+## CLI Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `DRIVER_NODE_ID` | **required** | Node name (`spec.nodeName`) |
-| `DRIVER_NODE_IP` | - | Static IP (fallback) |
-| `DRIVER_STORAGE_INTERFACE` | - | Storage NIC name (priority 1) |
-| `DRIVER_STORAGE_CIDR` | - | Storage subnet CIDR (priority 2) |
-| `DRIVER_ENDPOINT` | `unix:///csi/csi.sock` | gRPC socket |
-| `DRIVER_METRICS_ADDR` | `:9090` | Metrics address |
+| `AGENT_URL` | - | Agent API URL |
+| `AGENT_TOKEN` | - | Tenant token |
+| `BTRFS_NFS_CSI_FORCE` | `false` | Skip delete protection when `true` |
 
-**IP resolution order:** `DRIVER_STORAGE_INTERFACE` > `DRIVER_STORAGE_CIDR` > `DRIVER_NODE_IP`. At least one required.
-
-**Note:** `DRIVER_STORAGE_INTERFACE` and `DRIVER_STORAGE_CIDR` resolve IPs from the host's network interfaces. The node DaemonSet must have `hostNetwork: true` for this to work.
-
-## StorageClass Parameters
-
-Each StorageClass binds one agent + one tenant. The SC name is used in volume IDs (`{storageClassName}|{volumeName}`) - do not rename it after creating volumes. The `agentURL` can be changed safely (e.g. IP change, port change).
-
-| Parameter | Required | Description |
-|---|---|---|
-| `nfsServer` | yes | NFS server IP |
-| `agentURL` | yes | Agent REST API URL |
-| `nfsMountOptions` | no | NFS mount options |
-| `nocow` | no | `"true"` / `"false"` |
-| `compression` | no | `zstd`, `lzo`, `zlib`, `none` (with level: `zstd:3`) |
-| `uid` / `gid` | no | Volume owner |
-| `mode` | no | Octal permissions (default `"2770"`) |
-
-## PVC Annotations
-
-| Annotation | Values |
-|---|---|
-| `btrfs-nfs-csi/nocow` | `"true"`, `"false"` |
-| `btrfs-nfs-csi/compression` | `"zstd"`, `"lzo"`, `"zlib"`, `"none"` |
-| `btrfs-nfs-csi/uid` | integer |
-| `btrfs-nfs-csi/gid` | integer |
-| `btrfs-nfs-csi/mode` | octal string |
-
-Annotations override StorageClass defaults. Applied at create and on every attach.
-
-## Secret
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: btrfs-nfs-creds
-  namespace: btrfs-nfs-csi
-type: Opaque
-stringData:
-  agentToken: "changeme"  # must match AGENT_TENANTS token
-```
+Also configurable via `--agent-url` and `--agent-token` flags.
 
 ## TLS
 
-Set `AGENT_TLS_CERT` + `AGENT_TLS_KEY` → agent listens HTTPS (min TLS 1.2). Use `https://` in `agentURL`.
+Set `AGENT_TLS_CERT` + `AGENT_TLS_KEY` and the agent listens on HTTPS (min TLS 1.2). Use `https://` in `AGENT_URL` or `agentURL`.
+
+For self-signed certificates, set `AGENT_HTTP_CLIENT_TLS_SKIP_VERIFY=true`.

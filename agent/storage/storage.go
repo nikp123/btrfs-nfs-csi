@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/btrfs"
+	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/meta"
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/nfs"
+	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/task"
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
 	"github.com/erikmagkekse/btrfs-nfs-csi/utils"
 
@@ -20,14 +22,22 @@ import (
 
 // Storage encapsulates all btrfs volume, snapshot, and clone operations.
 type Storage struct {
-	basePath        string
-	mountPoint      string
-	quotaEnabled    bool
-	btrfs           *btrfs.Manager
-	exporter        nfs.Exporter
-	tenants         []string
-	defaultDirMode  os.FileMode
-	defaultDataMode string
+	basePath           string
+	mountPoint         string
+	quotaEnabled       bool
+	btrfs              *btrfs.Manager
+	exporter           nfs.Exporter
+	tenants            []string
+	defaultDirMode     os.FileMode
+	defaultDataMode    string
+	tasks              *task.Manager
+	taskDefaultTimeout time.Duration
+	taskScrubTimeout   time.Duration
+
+	immutableLabelKeys []string
+
+	volumes   *meta.Store[VolumeMetadata]
+	snapshots *meta.Store[SnapshotMetadata]
 
 	// cachedDevices is written by both the IO poller (5s) and btrfs stats poller (1m).
 	// Each poller loads the current state, updates its own fields (IO or Errors),
@@ -39,7 +49,7 @@ type Storage struct {
 	cachedFilesystem atomic.Pointer[btrfs.FilesystemUsage]
 }
 
-func New(basePath string, quotaEnabled bool, exporter nfs.Exporter, tenants []string, dirMode, dataMode, btrfsBin string) *Storage {
+func New(basePath string, quotaEnabled bool, exporter nfs.Exporter, tenants []string, dirMode, dataMode, btrfsBin, immutableLabels string, taskMaxConcurrent int, taskDefaultTimeout, taskScrubTimeout, taskPollInterval time.Duration) *Storage {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -80,7 +90,7 @@ func New(basePath string, quotaEnabled bool, exporter nfs.Exporter, tenants []st
 	}
 
 	for _, name := range tenants {
-		if err := validateName(name); err != nil {
+		if err := config.ValidateName(name); err != nil {
 			log.Fatal().Str("tenant", name).Msg("invalid tenant name")
 		}
 		td := filepath.Join(basePath, name)
@@ -109,31 +119,82 @@ func New(basePath string, quotaEnabled bool, exporter nfs.Exporter, tenants []st
 	for i, d := range devices {
 		initialStates[i] = DeviceState{BTRFSDevice: d}
 	}
-	s := &Storage{basePath: basePath, mountPoint: mountPoint, quotaEnabled: quotaEnabled, btrfs: mgr, exporter: exporter, tenants: tenants, defaultDirMode: os.FileMode(parsedDirMode), defaultDataMode: dataMode}
+	taskDir := filepath.Join(basePath, config.TasksDir)
+	s := &Storage{basePath: basePath, mountPoint: mountPoint, quotaEnabled: quotaEnabled, btrfs: mgr, exporter: exporter, tenants: tenants, defaultDirMode: os.FileMode(parsedDirMode), defaultDataMode: dataMode, immutableLabelKeys: ImmutableLabelKeys(immutableLabels), tasks: task.NewManager(taskDir, taskMaxConcurrent, taskPollInterval), taskDefaultTimeout: taskDefaultTimeout, taskScrubTimeout: taskScrubTimeout, volumes: meta.NewStore[VolumeMetadata](basePath), snapshots: meta.NewStore[SnapshotMetadata](basePath, config.SnapshotsDir)}
 	s.cachedDevices.Store(&initialStates)
+	s.loadCache()
 	return s
 }
 
-func (s *Storage) StartWorkers(ctx context.Context, usageInterval, reconcileInterval, deviceIOInterval, deviceStatsInterval time.Duration) {
+func (s *Storage) loadCache() {
 	for _, tenant := range s.tenants {
-		bp := filepath.Join(s.basePath, tenant)
+		tenantDir := filepath.Join(s.basePath, tenant)
+		volCount, snapCount := 0, 0
+
+		if entries, err := os.ReadDir(tenantDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() || e.Name() == config.SnapshotsDir {
+					continue
+				}
+				dataDir := s.volumes.DataPath(tenant, e.Name())
+				if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+					log.Warn().Str("tenant", tenant).Str("volume", e.Name()).Str("path", dataDir).Msg("cache: data directory missing, skipping phantom volume")
+					continue
+				}
+				if _, err := s.volumes.LoadFromDisk(tenant, e.Name()); err != nil {
+					log.Warn().Err(err).Str("tenant", tenant).Str("volume", e.Name()).Msg("cache: corrupt metadata, skipping")
+					continue
+				}
+				log.Debug().Str("tenant", tenant).Str("volume", e.Name()).Msg("cache: loaded volume")
+				volCount++
+			}
+		}
+
+		snapDir := filepath.Join(tenantDir, config.SnapshotsDir)
+		if entries, err := os.ReadDir(snapDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				dataDir := s.snapshots.DataPath(tenant, e.Name())
+				if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+					log.Warn().Str("tenant", tenant).Str("snapshot", e.Name()).Str("path", dataDir).Msg("cache: data directory missing, skipping phantom snapshot")
+					continue
+				}
+				if _, err := s.snapshots.LoadFromDisk(tenant, e.Name()); err != nil {
+					log.Warn().Err(err).Str("tenant", tenant).Str("snapshot", e.Name()).Msg("cache: corrupt metadata, skipping")
+					continue
+				}
+				log.Debug().Str("tenant", tenant).Str("snapshot", e.Name()).Msg("cache: loaded snapshot")
+				snapCount++
+			}
+		}
+
+		log.Info().Str("tenant", tenant).Int("volumes", volCount).Int("snapshots", snapCount).Msg("metadata cache loaded")
+	}
+}
+
+func (s *Storage) StartWorkers(ctx context.Context, usageInterval, reconcileInterval, deviceIOInterval, deviceStatsInterval, taskCleanupInterval time.Duration) {
+	for _, tenant := range s.tenants {
 		if s.quotaEnabled {
-			StartUsageUpdater(ctx, s.btrfs, bp, usageInterval, tenant)
+			s.startUsageUpdater(ctx, s.btrfs, usageInterval, tenant)
 		}
 		if reconcileInterval > 0 {
-			s.StartNFSReconciler(ctx, bp, reconcileInterval, tenant)
+			s.startNFSReconciler(ctx, reconcileInterval, tenant)
 		}
 	}
-	s.StartDeviceIOUpdater(ctx, deviceIOInterval)
-	s.StartDeviceStatsUpdater(ctx, deviceStatsInterval)
+	s.startDeviceIOUpdater(ctx, deviceIOInterval)
+	s.startDeviceStatsUpdater(ctx, deviceStatsInterval)
+	s.tasks.StartCleanup(ctx, taskCleanupInterval)
 }
 
 func (s *Storage) BasePath() string       { return s.basePath }
 func (s *Storage) QuotaEnabled() bool     { return s.quotaEnabled }
 func (s *Storage) Exporter() nfs.Exporter { return s.exporter }
+func (s *Storage) Tasks() *task.Manager   { return s.tasks }
 
 func (s *Storage) tenantPath(tenant string) (string, error) {
-	if err := validateName(tenant); err != nil {
+	if err := config.ValidateName(tenant); err != nil {
 		return "", err
 	}
 	bp := filepath.Join(s.basePath, tenant)

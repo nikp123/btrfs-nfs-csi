@@ -1,16 +1,14 @@
 name: Helm CI
 
 on:
-  push:
-    branches: [edge]
-    paths:
-      - "charts/**"
-      - ".github/workflows/ci-helm.yml"
   pull_request:
     branches: [main, edge]
     paths:
       - "charts/**"
       - ".github/workflows/ci-helm.yml"
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -20,7 +18,7 @@ jobs:
 
       - name: Verify appVersion matches VERSION
         run: |
-          APP_VERSION=$(grep 'appVersion:' charts/btrfs-nfs-csi/Chart.yaml | sed 's/.*"\(.*\)"/\1/')
+          APP_VERSION=$(grep '^appVersion:' charts/btrfs-nfs-csi/Chart.yaml | sed 's/.*"\(.*\)"/\1/')
           VERSION=$(cat VERSION)
           if [[ "${APP_VERSION}" != "${VERSION}" ]]; then
             echo "::error::Chart appVersion (${APP_VERSION}) does not match VERSION file (${VERSION})"

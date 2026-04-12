@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
@@ -15,13 +13,12 @@ import (
 )
 
 func (s *Storage) CreateVolume(ctx context.Context, tenant string, req VolumeCreateRequest) (*VolumeMetadata, error) {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return nil, err
 	}
 
 	// validation
-	if err := validateName(req.Name); err != nil {
+	if err := config.ValidateName(req.Name); err != nil {
 		return nil, err
 	}
 	if req.SizeBytes == 0 {
@@ -36,29 +33,47 @@ func (s *Storage) CreateVolume(ctx context.Context, tenant string, req VolumeCre
 	if req.QuotaBytes == 0 {
 		req.QuotaBytes = req.SizeBytes
 	}
+	if err := config.ValidateLabels(req.Labels); err != nil {
+		return nil, err
+	}
+	if err := requireImmutableLabels(s.immutableLabelKeys, req.Labels); err != nil {
+		return nil, err
+	}
+	if err := utils.ValidateUID(req.UID); err != nil {
+		return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
+	}
+	if err := utils.ValidateGID(req.GID); err != nil {
+		return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
+	}
 	if req.Mode == "" {
 		req.Mode = s.defaultDataMode
 	}
-	mode, err := strconv.ParseUint(req.Mode, 8, 32)
+	mode, err := utils.ValidateMode(req.Mode)
 	if err != nil {
-		return nil, &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("invalid mode: %s", req.Mode)}
+		return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
 	}
 
 	// operations
-	volDir := filepath.Join(bp, req.Name)
-	dataDir := filepath.Join(volDir, config.DataDir)
+	volDir := s.volumes.Dir(tenant, req.Name)
+	dataDir := s.volumes.DataPath(tenant, req.Name)
 
-	if _, err := os.Stat(volDir); err == nil {
-		var existing VolumeMetadata
-		if err := ReadMetadata(filepath.Join(volDir, config.MetadataFile), &existing); err != nil {
-			return nil, fmt.Errorf("volume %q exists but metadata is corrupt: %w", req.Name, err)
-		}
-		return &existing, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("volume %q already exists", req.Name)}
+	// Serialize concurrent creators of the same name. Losers block here and
+	// then observe the winner's cache entry on the Get below, returning a
+	// clean ALREADY_EXISTS instead of racing into btrfs.SubvolumeCreate.
+	// Lock honours ctx so a stuck predecessor cannot pin a caller forever.
+	unlock, err := s.volumes.Lock(ctx, tenant, req.Name)
+	if err != nil {
+		return nil, &StorageError{Code: ErrBusy, Message: fmt.Sprintf("lock contention for volume %q: %v", req.Name, err)}
+	}
+	defer unlock()
+
+	if existing, err := s.volumes.Get(tenant, req.Name); err == nil {
+		return existing, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("volume %q already exists", req.Name)}
 	}
 
 	if err := os.MkdirAll(volDir, s.defaultDirMode); err != nil {
 		log.Error().Err(err).Str("path", volDir).Msg("failed to create volume directory")
-		return nil, fmt.Errorf("create volume directory: %w", err)
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("create volume directory: %v", err)}
 	}
 
 	cleanup := func() {
@@ -71,9 +86,17 @@ func (s *Storage) CreateVolume(ctx context.Context, tenant string, req VolumeCre
 	}
 
 	if err := s.btrfs.SubvolumeCreate(ctx, dataDir); err != nil {
+		if isSubvolumeAlreadyExistsError(err) {
+			// Stale on-disk state from a prior crash that never made it into
+			// the cache. Do NOT touch volDir - it may belong to a concurrent
+			// creator that we do not know about (should not happen under the
+			// per-name lock, but be defensive).
+			log.Warn().Err(err).Str("path", dataDir).Msg("subvolume already exists on disk")
+			return nil, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("volume %q already exists on disk", req.Name)}
+		}
 		_ = os.RemoveAll(volDir)
 		log.Error().Err(err).Str("path", dataDir).Msg("failed to create subvolume")
-		return nil, fmt.Errorf("btrfs subvolume create failed: %w", err)
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("btrfs subvolume create failed: %v", err)}
 	}
 
 	if req.NoCOW {
@@ -118,11 +141,12 @@ func (s *Storage) CreateVolume(ctx context.Context, tenant string, req VolumeCre
 		UID:         req.UID,
 		GID:         req.GID,
 		Mode:        req.Mode,
+		Labels:      req.Labels,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 
-	if err := writeMetadataAtomic(filepath.Join(volDir, config.MetadataFile), meta); err != nil {
+	if err := s.volumes.Store(tenant, req.Name, &meta); err != nil {
 		log.Error().Err(err).Msg("failed to write metadata")
 		cleanup()
 		return nil, fmt.Errorf("failed to write metadata: %w", err)
@@ -133,71 +157,68 @@ func (s *Storage) CreateVolume(ctx context.Context, tenant string, req VolumeCre
 }
 
 func (s *Storage) ListVolumes(tenant string) ([]VolumeMetadata, error) {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return nil, err
 	}
-
-	entries, err := os.ReadDir(bp)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to read base path")
-		return nil, fmt.Errorf("failed to read base path: %w", err)
-	}
-
 	var vols []VolumeMetadata
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == config.SnapshotsDir {
-			continue
+	s.volumes.Range(func(t, _ string, val *VolumeMetadata) bool {
+		if t == tenant {
+			vols = append(vols, *val)
 		}
-		metaPath := filepath.Join(bp, e.Name(), config.MetadataFile)
-		var meta VolumeMetadata
-		if err := ReadMetadata(metaPath, &meta); err != nil {
-			continue
-		}
-		vols = append(vols, meta)
-	}
+		return true
+	})
 	log.Debug().Str("tenant", tenant).Int("count", len(vols)).Msg("volumes listed")
 	return vols, nil
 }
 
 func (s *Storage) GetVolume(tenant, name string) (*VolumeMetadata, error) {
-	bp, err := s.tenantPath(tenant)
+	if _, err := s.tenantPath(tenant); err != nil {
+		return nil, err
+	}
+	if err := config.ValidateName(name); err != nil {
+		return nil, err
+	}
+	meta, err := s.volumes.Get(tenant, name)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return nil, &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
+		}
+		return nil, &StorageError{Code: ErrMetadata, Message: fmt.Sprintf("volume %q: failed to read metadata: %v", name, err)}
 	}
-	if err := validateName(name); err != nil {
-		return nil, err
-	}
-
-	metaPath := filepath.Join(bp, name, config.MetadataFile)
-	var meta VolumeMetadata
-	if err := ReadMetadata(metaPath, &meta); err != nil {
-		return nil, &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
-	}
-	return &meta, nil
+	cp := *meta
+	return &cp, nil
 }
 
 func (s *Storage) UpdateVolume(ctx context.Context, tenant, name string, req VolumeUpdateRequest) (*VolumeMetadata, error) {
-	bp, err := s.tenantPath(tenant)
+	if _, err := s.tenantPath(tenant); err != nil {
+		return nil, err
+	}
+	if err := config.ValidateName(name); err != nil {
+		return nil, err
+	}
+
+	dataDir := s.volumes.DataPath(tenant, name)
+
+	cached, err := s.volumes.Get(tenant, name)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return nil, &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
+		}
+		return nil, &StorageError{Code: ErrMetadata, Message: fmt.Sprintf("volume %q: failed to read metadata: %v", name, err)}
 	}
-	if err := validateName(name); err != nil {
-		return nil, err
-	}
-
-	volDir := filepath.Join(bp, name)
-	metaPath := filepath.Join(volDir, config.MetadataFile)
-	dataDir := filepath.Join(volDir, config.DataDir)
-
-	var cur VolumeMetadata
-	if err := ReadMetadata(metaPath, &cur); err != nil {
-		return nil, &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
-	}
+	cur := *cached
 
 	// validation
-	if req.SizeBytes != nil && *req.SizeBytes <= cur.SizeBytes {
-		return nil, &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("new size %d must be larger than current size %d", *req.SizeBytes, cur.SizeBytes)}
+	if req.Labels != nil {
+		if err := config.ValidateLabels(*req.Labels); err != nil {
+			return nil, err
+		}
+		if err := protectImmutableLabels(s.immutableLabelKeys, cur.Labels, *req.Labels); err != nil {
+			return nil, err
+		}
+	}
+	if req.SizeBytes != nil && *req.SizeBytes < cur.SizeBytes {
+		return nil, &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("new size %d must be at least current size %d", *req.SizeBytes, cur.SizeBytes)}
 	}
 	if req.Compression != nil {
 		if !utils.IsValidCompression(*req.Compression) {
@@ -207,12 +228,22 @@ func (s *Storage) UpdateVolume(ctx context.Context, tenant, name string, req Vol
 			return nil, &StorageError{Code: ErrInvalid, Message: "nocow and compression are mutually exclusive"}
 		}
 	}
+	if req.UID != nil {
+		if err := utils.ValidateUID(*req.UID); err != nil {
+			return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
+		}
+	}
+	if req.GID != nil {
+		if err := utils.ValidateGID(*req.GID); err != nil {
+			return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
+		}
+	}
 	var parsedMode uint64
 	if req.Mode != nil {
 		var err error
-		parsedMode, err = strconv.ParseUint(*req.Mode, 8, 32)
+		parsedMode, err = utils.ValidateMode(*req.Mode)
 		if err != nil {
-			return nil, &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("invalid mode: %s", *req.Mode)}
+			return nil, &StorageError{Code: ErrInvalid, Message: err.Error()}
 		}
 	}
 
@@ -263,8 +294,7 @@ func (s *Storage) UpdateVolume(ctx context.Context, tenant, name string, req Vol
 		}
 	}
 
-	var updated VolumeMetadata
-	if err := UpdateMetadata(metaPath, func(meta *VolumeMetadata) {
+	updated, err := s.volumes.Update(tenant, name, func(meta *VolumeMetadata) {
 		if req.SizeBytes != nil {
 			meta.SizeBytes = *req.SizeBytes
 			meta.QuotaBytes = *req.SizeBytes
@@ -284,51 +314,149 @@ func (s *Storage) UpdateVolume(ctx context.Context, tenant, name string, req Vol
 		if req.Mode != nil {
 			meta.Mode = *req.Mode
 		}
+		if req.Labels != nil {
+			meta.Labels = *req.Labels
+		}
 		meta.UpdatedAt = time.Now().UTC()
-		updated = *meta
-	}); err != nil {
+	})
+	if err != nil {
 		log.Error().Err(err).Msg("failed to update metadata")
 		return nil, fmt.Errorf("failed to update metadata: %w", err)
 	}
 
 	log.Info().Str("tenant", tenant).Str("name", name).Msg("volume updated")
-	return &updated, nil
+	return updated, nil
+}
+
+func (s *Storage) CloneVolume(ctx context.Context, tenant string, req VolumeCloneRequest) (*VolumeMetadata, error) {
+	if _, err := s.tenantPath(tenant); err != nil {
+		return nil, err
+	}
+	if err := config.ValidateName(req.Name); err != nil {
+		return nil, err
+	}
+
+	labels := req.Labels
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[config.LabelCloneSourceType] = "volume"
+	labels[config.LabelCloneSourceName] = req.Source
+	if err := config.ValidateLabels(labels); err != nil {
+		return nil, err
+	}
+	if err := requireImmutableLabels(s.immutableLabelKeys, labels); err != nil {
+		return nil, err
+	}
+
+	src, err := s.GetVolume(tenant, req.Source)
+	if err != nil {
+		return nil, err
+	}
+
+	cloneDir := s.volumes.Dir(tenant, req.Name)
+
+	// Serialize concurrent creators of the same name (see CreateVolume).
+	unlock, err := s.volumes.Lock(ctx, tenant, req.Name)
+	if err != nil {
+		return nil, &StorageError{Code: ErrBusy, Message: fmt.Sprintf("lock contention for volume %q: %v", req.Name, err)}
+	}
+	defer unlock()
+
+	if existing, err := s.volumes.Get(tenant, req.Name); err == nil {
+		return existing, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("volume %q already exists", req.Name)}
+	}
+
+	if err := os.MkdirAll(cloneDir, s.defaultDirMode); err != nil {
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("create clone directory: %v", err)}
+	}
+
+	srcData := s.volumes.DataPath(tenant, req.Source)
+	cloneData := s.volumes.DataPath(tenant, req.Name)
+
+	cleanup := func() {
+		if err := s.btrfs.SubvolumeDelete(ctx, cloneData); err != nil {
+			log.Warn().Err(err).Str("path", cloneData).Msg("cleanup: failed to delete subvolume")
+		}
+		if err := os.RemoveAll(cloneDir); err != nil {
+			log.Warn().Err(err).Str("path", cloneDir).Msg("cleanup: failed to remove directory")
+		}
+	}
+
+	if err := s.btrfs.SubvolumeSnapshot(ctx, srcData, cloneData, false); err != nil {
+		if isSubvolumeAlreadyExistsError(err) {
+			log.Warn().Err(err).Str("path", cloneData).Msg("clone target already exists on disk")
+			return nil, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("volume %q already exists on disk", req.Name)}
+		}
+		cleanup()
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("btrfs snapshot failed: %v", err)}
+	}
+
+	if s.quotaEnabled {
+		if err := s.btrfs.QgroupLimit(ctx, cloneData, src.QuotaBytes); err != nil {
+			log.Error().Err(err).Str("path", cloneData).Msg("failed to set qgroup limit on clone")
+			cleanup()
+			return nil, fmt.Errorf("qgroup limit failed: %w", err)
+		}
+	}
+
+	now := time.Now().UTC()
+	meta := VolumeMetadata{
+		Name:        req.Name,
+		Path:        cloneDir,
+		SizeBytes:   src.SizeBytes,
+		NoCOW:       src.NoCOW,
+		Compression: src.Compression,
+		QuotaBytes:  src.QuotaBytes,
+		UID:         src.UID,
+		GID:         src.GID,
+		Mode:        src.Mode,
+		Labels:      labels,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	if err := s.volumes.Store(tenant, req.Name, &meta); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to write metadata: %w", err)
+	}
+
+	log.Info().Str("tenant", tenant).Str("name", req.Name).Str("source", req.Source).Msg("volume cloned")
+	return &meta, nil
 }
 
 func (s *Storage) DeleteVolume(ctx context.Context, tenant, name string) error {
-	bp, err := s.tenantPath(tenant)
+	if _, err := s.tenantPath(tenant); err != nil {
+		return err
+	}
+	if err := config.ValidateName(name); err != nil {
+		return err
+	}
+
+	meta, err := s.volumes.Get(tenant, name)
 	if err != nil {
-		return err
-	}
-	if err := validateName(name); err != nil {
-		return err
-	}
-
-	volDir := filepath.Join(bp, name)
-	if _, err := os.Stat(volDir); os.IsNotExist(err) {
-		return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
-	}
-
-	var meta VolumeMetadata
-	metaPath := filepath.Join(volDir, config.MetadataFile)
-	if err := ReadMetadata(metaPath, &meta); err != nil {
+		if os.IsNotExist(err) {
+			return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
+		}
 		return fmt.Errorf("failed to read volume metadata: %w", err)
 	}
-	if len(meta.Clients) > 0 {
+	if len(meta.Exports) > 0 {
 		return &StorageError{Code: ErrBusy, Message: fmt.Sprintf("volume %q still has active NFS exports", name)}
 	}
 
-	dataDir := filepath.Join(volDir, config.DataDir)
+	dataDir := s.volumes.DataPath(tenant, name)
 	if err := s.btrfs.SubvolumeDelete(ctx, dataDir); err != nil {
 		log.Error().Err(err).Msg("failed to delete subvolume")
 		return fmt.Errorf("btrfs subvolume delete failed: %w", err)
 	}
 
+	s.volumes.Delete(tenant, name)
+
+	volDir := s.volumes.Dir(tenant, name)
 	if err := os.RemoveAll(volDir); err != nil {
 		log.Error().Err(err).Msg("failed to remove volume directory")
 		return fmt.Errorf("failed to remove volume directory: %w", err)
 	}
-
 	log.Info().Str("tenant", tenant).Str("name", name).Msg("volume deleted")
 	return nil
 }

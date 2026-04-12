@@ -13,5 +13,7 @@ in buildGoModule {
     "-X main.version=${version} -X main.commit=${rev}"
   ];
 
-  vendorHash = "sha256-7hTHMheZKmu8AlR76VvMvJ/cn+px9iPsowtFKcTNQNA=";
+  subPackages = [ "cmd/btrfs-nfs-csi" ];
+
+  vendorHash = "sha256-GNFs41CTND7fkBkrVnGb7nVcIUPRMN+ipgTrqKCbgNw=";
 }

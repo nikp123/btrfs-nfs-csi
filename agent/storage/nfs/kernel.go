@@ -28,18 +28,35 @@ func NewKernelExporter(bin, exportOpts string) Exporter {
 	return &kernelExporter{bin: bin, cmd: &utils.ShellRunner{}, opts: exportOpts}
 }
 
+// exportfsClient wraps IPv6 addresses in brackets for exportfs compatibility.
+// exportfs requires [addr]:/path for IPv6 but addr:/path for IPv4.
+func exportfsClient(client string) string {
+	if strings.Contains(client, ":") {
+		return "[" + client + "]"
+	}
+	return client
+}
+
+// unwrapBrackets removes bracket wrapping from an IPv6 address returned by exportfs -v.
+func unwrapBrackets(client string) string {
+	if addr, _, ok := strings.Cut(client, "]"); ok && strings.HasPrefix(addr, "[") {
+		return strings.TrimPrefix(addr, "[")
+	}
+	return client
+}
+
 func (e *kernelExporter) Export(ctx context.Context, path string, client string) error {
 	fsid := crc32.ChecksumIEEE([]byte(path)) & fsidMask
 	if fsid == 0 {
 		fsid = 1
 	}
 	opts := fmt.Sprintf("%s,fsid=%d", e.opts, fsid)
-	return e.run(ctx, "-o", opts, fmt.Sprintf("%s:%s", client, path))
+	return e.run(ctx, "-o", opts, fmt.Sprintf("%s:%s", exportfsClient(client), path))
 }
 
 func (e *kernelExporter) Unexport(ctx context.Context, path string, client string) error {
 	if client != "" {
-		return e.tryUnexport(ctx, "-u", fmt.Sprintf("%s:%s", client, path))
+		return e.tryUnexport(ctx, "-u", fmt.Sprintf("%s:%s", exportfsClient(client), path))
 	}
 
 	// remove all clients for this path
@@ -50,7 +67,7 @@ func (e *kernelExporter) Unexport(ctx context.Context, path string, client strin
 
 	var lastErr error
 	for _, c := range clients {
-		if err := e.tryUnexport(ctx, "-u", fmt.Sprintf("%s:%s", c, path)); err != nil {
+		if err := e.tryUnexport(ctx, "-u", fmt.Sprintf("%s:%s", exportfsClient(c), path)); err != nil {
 			lastErr = err
 		}
 	}
@@ -75,7 +92,7 @@ func (e *kernelExporter) ListExports(ctx context.Context) ([]ExportInfo, error) 
 func parseExports(output string) []ExportInfo {
 	var exports []ExportInfo
 	var currentPath string
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
@@ -84,7 +101,8 @@ func parseExports(output string) []ExportInfo {
 		switch {
 		case !indented && len(fields) >= 2:
 			// path and client on same line
-			client := strings.SplitN(fields[1], "(", 2)[0]
+			raw, _, _ := strings.Cut(fields[1], "(")
+			client := unwrapBrackets(raw)
 			exports = append(exports, ExportInfo{Path: fields[0], Client: client})
 			currentPath = ""
 		case !indented:
@@ -92,7 +110,8 @@ func parseExports(output string) []ExportInfo {
 			currentPath = fields[0]
 		case currentPath != "":
 			// indented client line
-			client := strings.SplitN(fields[0], "(", 2)[0]
+			raw, _, _ := strings.Cut(fields[0], "(")
+			client := unwrapBrackets(raw)
 			exports = append(exports, ExportInfo{Path: currentPath, Client: client})
 			currentPath = ""
 		}

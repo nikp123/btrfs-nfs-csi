@@ -4,13 +4,17 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/btrfs"
+	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/meta"
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/nfs"
+	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/task"
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
 	"github.com/erikmagkekse/btrfs-nfs-csi/utils"
 	"github.com/stretchr/testify/mock"
@@ -25,6 +29,17 @@ type StorageIntegrationSuite struct {
 	loopDev   string
 	storage   *Storage
 	tenantDir string
+}
+
+func writeTestJSONFile(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStorageIntegration(t *testing.T) {
@@ -81,14 +96,21 @@ func (s *StorageIntegrationSuite) SetupSuite() {
 	exporter.On("Unexport", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	exporter.On("ListExports", mock.Anything).Return([]nfs.ExportInfo{}, nil).Maybe()
 
+	taskDir := filepath.Join(s.mnt, config.TasksDir)
+	s.Require().NoError(os.MkdirAll(taskDir, 0o755))
+
 	s.storage = &Storage{
 		basePath:        s.mnt,
+		mountPoint:      s.mnt,
 		quotaEnabled:    true,
 		btrfs:           btrfs.NewManager("btrfs"),
 		exporter:        exporter,
 		tenants:         []string{"test"},
 		defaultDirMode:  0o755,
 		defaultDataMode: "2770",
+		tasks:           task.NewManager(taskDir, 0, 0),
+		volumes:         meta.NewStore[VolumeMetadata](s.mnt),
+		snapshots:       meta.NewStore[SnapshotMetadata](s.mnt, config.SnapshotsDir),
 	}
 }
 
@@ -236,8 +258,6 @@ func (s *StorageIntegrationSuite) TestSnapshotLifecycle() {
 	s.Require().NoError(err)
 	s.Assert().Equal("my-snapshot", snap.Name)
 	s.Assert().Equal("snap-src", snap.Volume)
-	s.Assert().True(snap.ReadOnly)
-
 	// Verify snapshot subvolume is readonly
 	snapDataDir := filepath.Join(s.tenantDir, config.SnapshotsDir, "my-snapshot", config.DataDir)
 	s.Assert().True(s.storage.btrfs.SubvolumeExists(s.ctx, snapDataDir))
@@ -297,7 +317,6 @@ func (s *StorageIntegrationSuite) TestCloneLifecycle() {
 	})
 	s.Require().NoError(err)
 	s.Assert().Equal("my-clone", clone.Name)
-	s.Assert().Equal("clone-snap", clone.SourceSnapshot)
 
 	// Verify data exists in clone
 	cloneDataDir := filepath.Join(s.tenantDir, "my-clone", config.DataDir)
@@ -325,21 +344,22 @@ func (s *StorageIntegrationSuite) TestExportMetadataPersistence() {
 	exporter.On("Unexport", mock.Anything, volDir, "10.0.0.1").Return(nil)
 
 	// Export
-	err = s.storage.ExportVolume(s.ctx, "test", "export-vol", "10.0.0.1")
+	err = s.storage.CreateVolumeExport(s.ctx, "test", "export-vol", "10.0.0.1", nil)
 	s.Require().NoError(err)
 
 	var meta VolumeMetadata
-	s.Require().NoError(ReadMetadata(filepath.Join(volDir, config.MetadataFile), &meta))
-	s.Assert().Contains(meta.Clients, "10.0.0.1")
+	readTestJSON(s.T(), filepath.Join(volDir, config.MetadataFile), &meta)
+	s.Require().Len(meta.Exports, 1)
+	s.Assert().Equal("10.0.0.1", meta.Exports[0].IP)
 	s.Assert().NotNil(meta.LastAttachAt)
 
 	// Unexport
-	err = s.storage.UnexportVolume(s.ctx, "test", "export-vol", "10.0.0.1")
+	err = s.storage.DeleteVolumeExport(s.ctx, "test", "export-vol", "10.0.0.1", nil)
 	s.Require().NoError(err)
 
 	var afterUnexport VolumeMetadata
-	s.Require().NoError(ReadMetadata(filepath.Join(volDir, config.MetadataFile), &afterUnexport))
-	s.Assert().NotContains(afterUnexport.Clients, "10.0.0.1")
+	readTestJSON(s.T(), filepath.Join(volDir, config.MetadataFile), &afterUnexport)
+	s.Assert().Empty(afterUnexport.Exports)
 
 	exporter.AssertExpectations(s.T())
 
@@ -375,4 +395,174 @@ func (s *StorageIntegrationSuite) TestDeleteNonexistent() {
 	var se *StorageError
 	s.Require().ErrorAs(err, &se)
 	s.Assert().Equal(ErrNotFound, se.Code)
+}
+
+func (s *StorageIntegrationSuite) TestStartScrub() {
+	// write data so scrub has something to check
+	_, err := s.storage.CreateVolume(s.ctx, "test", VolumeCreateRequest{
+		Name: "scrub-vol", SizeBytes: 10 * 1024 * 1024,
+	})
+	s.Require().NoError(err)
+	dataDir := filepath.Join(s.tenantDir, "scrub-vol", config.DataDir)
+	s.Require().NoError(os.WriteFile(filepath.Join(dataDir, "testfile"), make([]byte, 64*1024), 0o644))
+	_, err = s.cmd.Run(s.ctx, "sync")
+	s.Require().NoError(err)
+
+	// start scrub via storage layer
+	taskID, err := s.storage.StartScrub(s.ctx, nil, nil, 0)
+	s.Require().NoError(err)
+	s.Assert().NotEmpty(taskID)
+
+	// wait for completion
+	var tsk *task.Task
+	for i := 0; i < 30; i++ {
+		tsk, err = s.storage.Tasks().Get(taskID)
+		s.Require().NoError(err)
+		if tsk.Status == task.TaskCompleted || tsk.Status == task.TaskFailed {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	s.Assert().Equal(task.TaskCompleted, tsk.Status)
+	s.Assert().Equal(100, tsk.Progress)
+	s.Assert().NotNil(tsk.Result, "should have scrub result")
+}
+
+func (s *StorageIntegrationSuite) TestStartScrubDuplicate() {
+	// start a blocking scrub in background
+	started := make(chan struct{})
+	s.storage.Tasks().Create(string(task.TypeScrub), task.TaskOpts{}, func(ctx context.Context, update *task.Update) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	<-started
+
+	// second scrub should be rejected
+	_, err := s.storage.StartScrub(s.ctx, nil, nil, 0)
+	s.Require().Error(err)
+	var se *StorageError
+	s.Require().ErrorAs(err, &se)
+	s.Assert().Equal(ErrBusy, se.Code)
+}
+
+func (s *StorageIntegrationSuite) TestTaskPersistence() {
+	taskDir := filepath.Join(s.mnt, config.TasksDir)
+
+	// submit a task that completes
+	id := s.storage.Tasks().Create("test", task.TaskOpts{}, func(ctx context.Context, update *task.Update) error {
+		return update.SetResult(map[string]string{"key": "value"})
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	// task file should exist
+	taskFile := filepath.Join(taskDir, id+".json")
+	_, err := os.Stat(taskFile)
+	s.Assert().NoError(err, "task file should exist on disk")
+
+	// read the file and verify
+	var persisted task.Task
+	readTestJSON(s.T(), taskFile, &persisted)
+	s.Assert().Equal(id, persisted.ID)
+	s.Assert().Equal(task.TaskCompleted, persisted.Status)
+	s.Assert().NotNil(persisted.Result)
+}
+
+func (s *StorageIntegrationSuite) TestTaskLoadFromDisk() {
+	taskDir := filepath.Join(s.mnt, config.TasksDir)
+
+	// write a "running" task file (simulates agent crash)
+	staleTask := task.Task{
+		ID:     "stale-task-123",
+		Type:   "test",
+		Status: task.TaskRunning,
+	}
+	writeTestJSONFile(s.T(), filepath.Join(taskDir, "stale-task-123.json"), &staleTask)
+
+	// create new TaskManager (triggers loadFromDisk)
+	tm := task.NewManager(taskDir, 0, 0)
+
+	// stale task should be marked failed
+	tsk, err := tm.Get("stale-task-123")
+	s.Require().NoError(err)
+	s.Assert().Equal(task.TaskFailed, tsk.Status)
+	s.Assert().Equal("agent restarted", tsk.Error)
+	s.Assert().NotNil(tsk.CompletedAt)
+}
+
+func (s *StorageIntegrationSuite) TestTaskCleanupRemovesFiles() {
+	taskDir := filepath.Join(s.mnt, config.TasksDir)
+
+	id := s.storage.Tasks().Create("test", task.TaskOpts{}, func(ctx context.Context, update *task.Update) error {
+		return nil
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	// file exists
+	taskFile := filepath.Join(taskDir, id+".json")
+	_, err := os.Stat(taskFile)
+	s.Assert().NoError(err)
+
+	// cleanup with 0 maxAge
+	s.storage.Tasks().Cleanup(0)
+
+	// file should be gone
+	_, err = os.Stat(taskFile)
+	s.Assert().True(os.IsNotExist(err), "task file should be removed after cleanup")
+
+	// task should be gone from memory too
+	_, err = s.storage.Tasks().Get(id)
+	s.Assert().ErrorIs(err, task.ErrNotFound)
+}
+
+func (s *StorageIntegrationSuite) TestScrubOnEmptyFilesystem() {
+	// no volumes, no data -- scrub should still work
+	taskID, err := s.storage.StartScrub(s.ctx, nil, nil, 0)
+	s.Require().NoError(err)
+
+	for i := 0; i < 30; i++ {
+		tsk, err := s.storage.Tasks().Get(taskID)
+		s.Require().NoError(err)
+		if tsk.Status == task.TaskCompleted || tsk.Status == task.TaskFailed {
+			s.Assert().Equal(task.TaskCompleted, tsk.Status)
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (s *StorageIntegrationSuite) TestScrubRestartRecovery() {
+	taskDir := filepath.Join(s.mnt, config.TasksDir)
+
+	// simulate a scrub that was running when agent crashed
+	staleTask := task.Task{
+		ID:     "stale-scrub",
+		Type:   string(task.TypeScrub),
+		Status: task.TaskRunning,
+	}
+	writeTestJSONFile(s.T(), filepath.Join(taskDir, "stale-scrub.json"), &staleTask)
+
+	// create new TaskManager (simulates agent restart)
+	tm := task.NewManager(taskDir, 0, 0)
+
+	// stale scrub should be failed
+	tsk, err := tm.Get("stale-scrub")
+	s.Require().NoError(err)
+	s.Assert().Equal(task.TaskFailed, tsk.Status)
+	s.Assert().Equal("agent restarted", tsk.Error)
+
+	// should be able to start a new scrub (stale one doesn't block)
+	s.storage.tasks = tm
+	newID, err := s.storage.StartScrub(s.ctx, nil, nil, 0)
+	s.Require().NoError(err)
+	s.Assert().NotEmpty(newID)
+
+	for i := 0; i < 30; i++ {
+		t, _ := tm.Get(newID)
+		if t.Status == task.TaskCompleted || t.Status == task.TaskFailed {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }

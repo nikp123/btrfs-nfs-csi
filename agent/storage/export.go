@@ -4,115 +4,136 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
-
 	"github.com/rs/zerolog/log"
 )
 
-func (s *Storage) ExportVolume(ctx context.Context, tenant, name, client string) error {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+func (s *Storage) CreateVolumeExport(ctx context.Context, tenant, name, client string, labels map[string]string) error {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return err
 	}
-	if err := validateName(name); err != nil {
+	if err := config.ValidateName(name); err != nil {
+		return err
+	}
+	if err := validateClientIP(client); err != nil {
+		return err
+	}
+	if err := config.ValidateLabels(labels); err != nil {
+		return err
+	}
+	if err := requireImmutableLabels(s.immutableLabelKeys, labels); err != nil {
 		return err
 	}
 
-	volDir := filepath.Join(bp, name)
-	if _, err := os.Stat(volDir); os.IsNotExist(err) {
-		return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
-	}
+	volDir := s.volumes.Dir(tenant, name)
 
 	// metadata first - if export fails, reconciler will re-export
-	metaPath := filepath.Join(volDir, config.MetadataFile)
-	if err := UpdateMetadata(metaPath, func(meta *VolumeMetadata) {
-		found := false
-		for _, c := range meta.Clients {
-			if c == client {
-				found = true
-				break
-			}
-		}
+	var firstRef bool
+	if _, err := s.volumes.Update(tenant, name, func(meta *VolumeMetadata) {
 		now := time.Now().UTC()
 		meta.LastAttachAt = &now
 		meta.UpdatedAt = now
-		if !found {
-			meta.Clients = append(meta.Clients, client)
+		if hasExport(meta.Exports, client, labels) {
+			return
 		}
+		firstRef = exportsForIP(meta.Exports, client) == 0
+		meta.Exports = append(meta.Exports, ExportMetadata{IP: client, Labels: labels, CreatedAt: now})
 	}); err != nil {
+		if os.IsNotExist(err) {
+			return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
+		}
 		log.Error().Err(err).Msg("failed to persist client in metadata")
 		return fmt.Errorf("failed to persist client in metadata: %w", err)
 	}
 
-	if err := s.exporter.Export(ctx, volDir, client); err != nil {
-		log.Error().Err(err).Str("name", name).Str("client", client).Msg("failed to export, reconciler will retry")
-		return fmt.Errorf("nfs export failed: %w", err)
+	if firstRef {
+		if err := s.exporter.Export(ctx, volDir, client); err != nil {
+			log.Error().Err(err).Str("name", name).Str("client", client).Msg("failed to export, reconciler will retry")
+			return &StorageError{Code: ErrInternal, Message: "nfs export failed"}
+		}
 	}
 
 	log.Info().Str("tenant", tenant).Str("name", name).Str("client", client).Msg("NFS export added")
 	return nil
 }
 
-func (s *Storage) UnexportVolume(ctx context.Context, tenant, name, client string) error {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+func (s *Storage) DeleteVolumeExport(ctx context.Context, tenant, name, client string, labels map[string]string) error {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return err
 	}
-	if err := validateName(name); err != nil {
+	if err := config.ValidateName(name); err != nil {
+		return err
+	}
+	if err := validateClientIP(client); err != nil {
+		return err
+	}
+	if err := config.ValidateLabels(labels); err != nil {
 		return err
 	}
 
-	volDir := filepath.Join(bp, name)
-	if _, err := os.Stat(volDir); os.IsNotExist(err) {
-		return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
-	}
+	volDir := s.volumes.Dir(tenant, name)
 
 	// metadata first - if unexport fails, reconciler will clean up
-	metaPath := filepath.Join(volDir, config.MetadataFile)
-	if err := UpdateMetadata(metaPath, func(meta *VolumeMetadata) {
-		filtered := meta.Clients[:0]
-		for _, c := range meta.Clients {
-			if c != client {
+	var lastRef bool
+	if _, err := s.volumes.Update(tenant, name, func(meta *VolumeMetadata) {
+		var removed bool
+		filtered := meta.Exports[:0]
+		for _, c := range meta.Exports {
+			if c.IP != client {
 				filtered = append(filtered, c)
+				continue
+			}
+			// labels == nil: remove all refs for this IP
+			// labels != nil: remove only matching entry
+			if labels != nil && !labelsContain(c.Labels, labels) {
+				filtered = append(filtered, c)
+			} else {
+				removed = true
 			}
 		}
-		meta.Clients = filtered
+		meta.Exports = filtered
+		lastRef = removed && exportsForIP(filtered, client) == 0
 		meta.UpdatedAt = time.Now().UTC()
 	}); err != nil {
+		if os.IsNotExist(err) {
+			return &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("volume %q not found", name)}
+		}
 		log.Error().Err(err).Msg("failed to update client list in metadata")
 		return fmt.Errorf("failed to update client list in metadata: %w", err)
 	}
 
-	if err := s.exporter.Unexport(ctx, volDir, client); err != nil {
-		log.Error().Err(err).Str("name", name).Str("client", client).Msg("failed to unexport, reconciler will clean up")
-		return fmt.Errorf("nfs unexport failed: %w", err)
+	if lastRef {
+		if err := s.exporter.Unexport(ctx, volDir, client); err != nil {
+			log.Error().Err(err).Str("name", name).Str("client", client).Msg("failed to unexport, reconciler will clean up")
+			return &StorageError{Code: ErrInternal, Message: "nfs unexport failed"}
+		}
 	}
 
 	log.Info().Str("tenant", tenant).Str("name", name).Str("client", client).Msg("NFS export removed")
 	return nil
 }
 
-func (s *Storage) ListExports(ctx context.Context, tenant string) ([]ExportEntry, error) {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+func (s *Storage) ListVolumeExports(tenant string) ([]ExportEntry, error) {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return nil, err
 	}
 
-	exports, err := s.exporter.ListExports(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list exports failed: %w", err)
-	}
-
 	var entries []ExportEntry
-	for _, e := range exports {
-		if strings.HasPrefix(e.Path, bp+"/") {
-			entries = append(entries, ExportEntry{Path: e.Path, Client: e.Client})
+	s.volumes.Range(func(t, name string, meta *VolumeMetadata) bool {
+		if t != tenant {
+			return true
 		}
-	}
-	log.Debug().Str("tenant", tenant).Int("count", len(entries)).Msg("exports listed")
+		for _, c := range meta.Exports {
+			entries = append(entries, ExportEntry{
+				Name:      name,
+				Client:    c.IP,
+				Labels:    c.Labels,
+				CreatedAt: c.CreatedAt,
+			})
+		}
+		return true
+	})
 	return entries, nil
 }

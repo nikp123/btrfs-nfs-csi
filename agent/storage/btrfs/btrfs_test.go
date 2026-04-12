@@ -496,3 +496,262 @@ func TestDevices(t *testing.T) {
 		assert.ErrorContains(t, err, "no devices found")
 	})
 }
+
+func TestScrubStatus(t *testing.T) {
+	t.Run("finished", func(t *testing.T) {
+		out := strings.Join([]string{
+			"UUID:             a8172da2-5e15-4125-bb09-23169dafd6da",
+			"Scrub started:    Wed Apr  1 10:00:00 2026",
+			"Status:           finished",
+			"Duration:         0:05:23",
+			"Total to scrub:   40.00GiB",
+			"Rate:             127.45MiB/s",
+			"data_extents_scrubbed: 524288",
+			"tree_extents_scrubbed: 16384",
+			"data_bytes_scrubbed: 536870912",
+			"tree_bytes_scrubbed: 268435456",
+			"read_errors: 0",
+			"csum_errors: 0",
+			"verify_errors: 0",
+			"no_csum: 0",
+			"csum_discards: 0",
+			"super_errors: 0",
+			"malloc_errors: 0",
+			"uncorrectable_errors: 0",
+			"unverified_errors: 0",
+			"corrected_errors: 0",
+			"last_physical: 536870912",
+		}, "\n")
+
+		m := &utils.MockRunner{Out: out}
+		mgr := newTestManager(m)
+
+		s, err := mgr.ScrubStatus(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		assert.False(t, s.Running)
+		assert.Equal(t, uint64(536870912), s.DataBytesScrubbed)
+		assert.Equal(t, uint64(268435456), s.TreeBytesScrubbed)
+		assert.Equal(t, uint64(0), s.ReadErrors)
+		assert.Equal(t, uint64(0), s.CSumErrors)
+		assert.Equal(t, uint64(0), s.VerifyErrors)
+		assert.Equal(t, uint64(0), s.SuperErrors)
+		assert.Equal(t, uint64(0), s.UncorrectableErrs)
+		assert.Equal(t, uint64(0), s.CorrectedErrs)
+	})
+
+	t.Run("running", func(t *testing.T) {
+		out := strings.Join([]string{
+			"UUID:             a8172da2-5e15-4125-bb09-23169dafd6da",
+			"Scrub started:    Wed Apr  1 10:00:00 2026",
+			"Status:           running",
+			"data_bytes_scrubbed: 100000000",
+			"tree_bytes_scrubbed: 50000000",
+			"read_errors: 0",
+			"csum_errors: 0",
+		}, "\n")
+
+		m := &utils.MockRunner{Out: out}
+		mgr := newTestManager(m)
+
+		s, err := mgr.ScrubStatus(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		assert.True(t, s.Running)
+		assert.Equal(t, uint64(100000000), s.DataBytesScrubbed)
+		assert.Equal(t, uint64(50000000), s.TreeBytesScrubbed)
+	})
+
+	t.Run("with errors", func(t *testing.T) {
+		out := strings.Join([]string{
+			"Status:           finished",
+			"data_bytes_scrubbed: 536870912",
+			"tree_bytes_scrubbed: 268435456",
+			"read_errors: 3",
+			"csum_errors: 2",
+			"verify_errors: 1",
+			"super_errors: 0",
+			"uncorrectable_errors: 5",
+			"corrected_errors: 1",
+		}, "\n")
+
+		m := &utils.MockRunner{Out: out}
+		mgr := newTestManager(m)
+
+		s, err := mgr.ScrubStatus(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), s.ReadErrors)
+		assert.Equal(t, uint64(2), s.CSumErrors)
+		assert.Equal(t, uint64(1), s.VerifyErrors)
+		assert.Equal(t, uint64(5), s.UncorrectableErrs)
+		assert.Equal(t, uint64(1), s.CorrectedErrs)
+	})
+
+	t.Run("command error", func(t *testing.T) {
+		m := &utils.MockRunner{Err: fmt.Errorf("scrub status failed")}
+		mgr := newTestManager(m)
+
+		_, err := mgr.ScrubStatus(context.Background(), "/mnt/data")
+		require.Error(t, err)
+	})
+
+	t.Run("scrub start uses foreground mode", func(t *testing.T) {
+		m := &utils.MockRunner{}
+		mgr := newTestManager(m)
+
+		err := mgr.ScrubStart(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		require.Len(t, m.Calls, 1)
+		assert.Equal(t, []string{"scrub", "start", "-B", "/mnt/data"}, m.Calls[0])
+	})
+}
+
+func TestParseSubvolumeListFull(t *testing.T) {
+	t.Run("multiple entries", func(t *testing.T) {
+		out := strings.Join([]string{
+			"ID 259 gen 12 top level 5 path tenant/vol1/data",
+			"ID 260 gen 13 top level 5 path tenant/vol2/data",
+			"ID 261 gen 14 top level 5 path tenant/snapshots/snap1/data",
+		}, "\n")
+
+		entries := parseSubvolumeListFull(out)
+		require.Len(t, entries, 3)
+		assert.Equal(t, "259", entries[0].ID)
+		assert.Equal(t, "tenant/vol1/data", entries[0].Path)
+		assert.Equal(t, "260", entries[1].ID)
+		assert.Equal(t, "tenant/vol2/data", entries[1].Path)
+		assert.Equal(t, "261", entries[2].ID)
+		assert.Equal(t, "tenant/snapshots/snap1/data", entries[2].Path)
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		entries := parseSubvolumeListFull("")
+		assert.Empty(t, entries)
+	})
+
+	t.Run("skips non-ID lines", func(t *testing.T) {
+		out := "some header line\nID 259 gen 12 top level 5 path vol1\n"
+		entries := parseSubvolumeListFull(out)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "259", entries[0].ID)
+	})
+}
+
+func TestParseQgroupMap(t *testing.T) {
+	t.Run("multiple entries", func(t *testing.T) {
+		out := strings.Join([]string{
+			"qgroupid         rfer         excl",
+			"--------         ----         ----",
+			"0/259        16384         8192",
+			"0/260        32768         4096",
+		}, "\n")
+
+		m, err := parseQgroupMap(out)
+		require.NoError(t, err)
+		require.Len(t, m, 2)
+		assert.Equal(t, uint64(16384), m["0/259"].Referenced)
+		assert.Equal(t, uint64(8192), m["0/259"].Exclusive)
+		assert.Equal(t, uint64(32768), m["0/260"].Referenced)
+		assert.Equal(t, uint64(4096), m["0/260"].Exclusive)
+	})
+
+	t.Run("skips headers", func(t *testing.T) {
+		out := "qgroupid         rfer         excl\n--------         ----         ----\n"
+		m, err := parseQgroupMap(out)
+		require.NoError(t, err)
+		assert.Empty(t, m)
+	})
+
+	t.Run("parse error", func(t *testing.T) {
+		out := "0/259        abc         8192\n"
+		_, err := parseQgroupMap(out)
+		assert.Error(t, err)
+	})
+}
+
+func TestQgroupUsageBulk(t *testing.T) {
+	listOutput := strings.Join([]string{
+		"ID 259 gen 12 top level 5 path tenant/vol1/data",
+		"ID 260 gen 13 top level 5 path tenant/vol2/data",
+		"ID 261 gen 14 top level 5 path tenant/snapshots/snap1/data",
+	}, "\n")
+
+	qgroupOutput := strings.Join([]string{
+		"qgroupid         rfer         excl",
+		"--------         ----         ----",
+		"0/5          16384        16384",
+		"0/259        10000         5000",
+		"0/260        20000         8000",
+		"0/261         3000         1000",
+	}, "\n")
+
+	t.Run("success", func(t *testing.T) {
+		m := &utils.MockRunner{
+			RunFn: func(args []string) (string, error) {
+				if slices.Contains(args, "list") {
+					return listOutput, nil
+				}
+				return qgroupOutput, nil
+			},
+		}
+		mgr := newTestManager(m)
+
+		result, err := mgr.QgroupUsageBulk(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		require.Len(t, result, 3)
+
+		assert.Equal(t, uint64(10000), result["tenant/vol1/data"].Referenced)
+		assert.Equal(t, uint64(5000), result["tenant/vol1/data"].Exclusive)
+		assert.Equal(t, uint64(20000), result["tenant/vol2/data"].Referenced)
+		assert.Equal(t, uint64(3000), result["tenant/snapshots/snap1/data"].Referenced)
+
+		require.Len(t, m.Calls, 2, "should make exactly 2 btrfs calls")
+	})
+
+	t.Run("subvol without qgroup is skipped", func(t *testing.T) {
+		// qgroup output missing 0/260
+		partialQgroup := strings.Join([]string{
+			"0/259        10000         5000",
+			"0/261         3000         1000",
+		}, "\n")
+
+		m := &utils.MockRunner{
+			RunFn: func(args []string) (string, error) {
+				if slices.Contains(args, "list") {
+					return listOutput, nil
+				}
+				return partialQgroup, nil
+			},
+		}
+		mgr := newTestManager(m)
+
+		result, err := mgr.QgroupUsageBulk(context.Background(), "/mnt/data")
+		require.NoError(t, err)
+		assert.Len(t, result, 2)
+		_, hasVol2 := result["tenant/vol2/data"]
+		assert.False(t, hasVol2)
+	})
+
+	t.Run("subvolume list error", func(t *testing.T) {
+		m := &utils.MockRunner{Err: fmt.Errorf("list failed")}
+		mgr := newTestManager(m)
+
+		_, err := mgr.QgroupUsageBulk(context.Background(), "/mnt/data")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "subvolume list")
+	})
+
+	t.Run("qgroup show error", func(t *testing.T) {
+		m := &utils.MockRunner{
+			RunFn: func(args []string) (string, error) {
+				if slices.Contains(args, "list") {
+					return listOutput, nil
+				}
+				return "", fmt.Errorf("qgroup show failed")
+			},
+		}
+		mgr := newTestManager(m)
+
+		_, err := mgr.QgroupUsageBulk(context.Background(), "/mnt/data")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "qgroup show")
+	})
+}

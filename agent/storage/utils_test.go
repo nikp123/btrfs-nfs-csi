@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/btrfs"
+	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/meta"
 	"github.com/erikmagkekse/btrfs-nfs-csi/agent/storage/nfs"
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
 	"github.com/erikmagkekse/btrfs-nfs-csi/utils"
@@ -19,11 +21,20 @@ import (
 
 // --- test utils for storage operations ---
 
-// testStorageWithRunner creates a Storage with a configurable MockRunner and MockExporter.
+// testStorageWithRunner creates a Storage with a configurable Runner and MockExporter.
 // Sets defaultDataMode to "2770" (matching the default agent config).
-func testStorageWithRunner(t *testing.T, runner *utils.MockRunner, exporter *nfs.MockExporter) (*Storage, string) {
+// Accepts any utils.Runner so concurrent tests can supply a thread-safe runner.
+func testStorageWithRunner(t *testing.T, runner utils.Runner, exporter *nfs.MockExporter) (*Storage, string) {
 	t.Helper()
 	base := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				meta.ClearImmutable(path)
+			}
+			return nil
+		})
+	})
 	tenant := "test"
 	tenantPath := filepath.Join(base, tenant)
 	require.NoError(t, os.MkdirAll(tenantPath, 0o755))
@@ -38,6 +49,9 @@ func testStorageWithRunner(t *testing.T, runner *utils.MockRunner, exporter *nfs
 		tenants:         []string{tenant},
 		defaultDirMode:  0o755,
 		defaultDataMode: "2770",
+		// immutableLabelKeys left nil to avoid requiring created-by in every test
+		volumes:   meta.NewStore[VolumeMetadata](base),
+		snapshots: meta.NewStore[SnapshotMetadata](base, config.SnapshotsDir),
 	}
 	return s, tenantPath
 }
@@ -52,16 +66,25 @@ func newTestStorage(t *testing.T) (*Storage, string, *utils.MockRunner, *nfs.Moc
 	return s, bp, runner, exporter
 }
 
-func writeSnapshotMetadata(t *testing.T, snapDir string, meta SnapshotMetadata) {
+func writeSnapshotMetadata(t *testing.T, s *Storage, snapDir string, meta SnapshotMetadata) {
 	t.Helper()
 	data, err := json.MarshalIndent(meta, "", "  ")
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(snapDir, config.MetadataFile), data, 0o644))
+	if s != nil {
+		s.snapshots.Seed("test", meta.Name, &meta)
+	}
 }
 
 func requireStorageError(t *testing.T, err error, code string) {
 	t.Helper()
 	require.Error(t, err)
+	if code == ErrInvalid {
+		var ve *config.ValidationError
+		if errors.As(err, &ve) {
+			return
+		}
+	}
 	var se *StorageError
 	require.True(t, errors.As(err, &se), "expected *StorageError, got %T: %v", err, err)
 	assert.Equal(t, code, se.Code)
@@ -77,12 +100,44 @@ func containsCall(calls [][]string, args ...string) bool {
 	return false
 }
 
-// readVolumeMeta reads VolumeMetadata from disk into a fresh struct (avoids omitempty pitfalls).
+// readTestJSON reads and unmarshals a JSON file (test-only disk read helper).
+func readTestJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, v))
+}
+
+// readVolumeMeta reads VolumeMetadata from disk into a fresh struct.
 func readVolumeMeta(t *testing.T, volDir string) VolumeMetadata {
 	t.Helper()
-	var meta VolumeMetadata
-	require.NoError(t, ReadMetadata(filepath.Join(volDir, config.MetadataFile), &meta))
-	return meta
+	var m VolumeMetadata
+	readTestJSON(t, filepath.Join(volDir, config.MetadataFile), &m)
+	return m
+}
+
+// seedVolume writes volume metadata to disk AND seeds the cache.
+func seedVolume(t *testing.T, s *Storage, tenant, bp string, meta VolumeMetadata) string {
+	t.Helper()
+	dir := filepath.Join(bp, meta.Name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	data, err := json.MarshalIndent(meta, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, config.MetadataFile), data, 0o644))
+	s.volumes.Seed(tenant, meta.Name, &meta)
+	return dir
+}
+
+// seedSnapshot writes snapshot metadata to disk AND seeds the cache.
+func seedSnapshot(t *testing.T, s *Storage, tenant, bp string, meta SnapshotMetadata) string {
+	t.Helper()
+	dir := filepath.Join(bp, config.SnapshotsDir, meta.Name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	data, err := json.MarshalIndent(meta, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, config.MetadataFile), data, 0o644))
+	s.snapshots.Seed(tenant, meta.Name, &meta)
+	return dir
 }
 
 func ptrUint64(v uint64) *uint64 { return &v }
@@ -119,17 +174,155 @@ func TestValidateName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateName(tt.input)
+			err := config.ValidateName(tt.input)
 			if !tt.wantErr {
 				assert.NoError(t, err)
 				return
 			}
 			require.Error(t, err)
-			var se *StorageError
-			require.ErrorAs(t, err, &se)
-			assert.Equal(t, ErrInvalid, se.Code)
+			var ve *config.ValidationError
+			require.ErrorAs(t, err, &ve)
 		})
 	}
+}
+
+func TestValidateClientIP(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid_ipv4", "10.0.0.1", false},
+		{"valid_ipv4_localhost", "127.0.0.1", false},
+		{"valid_ipv6_loopback", "::1", false},
+		{"valid_ipv6_full", "2001:db8::1", false},
+		{"wildcard", "*", true},
+		{"hostname", "node1.example.com", true},
+		{"cidr_v4", "10.0.0.0/24", true},
+		{"cidr_v6", "2001:db8::/32", true},
+		{"parens_injection", "10.0.0.1(rw,no_root_squash)", true},
+		{"semicolon_injection", "10.0.0.1;rm -rf /", true},
+		{"empty", "", true},
+		{"space", "10.0.0.1 10.0.0.2", true},
+		{"newline", "10.0.0.1\n10.0.0.2", true},
+		{"tab", "10.0.0.1\t10.0.0.2", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateClientIP(tt.input)
+			if !tt.wantErr {
+				assert.NoError(t, err)
+				return
+			}
+			requireStorageError(t, err, ErrInvalid)
+		})
+	}
+}
+
+func TestValidateLabels(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		wantErr bool
+	}{
+		{"nil", nil, false},
+		{"empty", map[string]string{}, false},
+		{"valid_single", map[string]string{"env": "prod"}, false},
+		{"valid_multiple", map[string]string{"env": "prod", "team": "backend"}, false},
+		{"valid_dots_dashes", map[string]string{"app.kubernetes.io": "my-app"}, false},
+		{"empty_value", map[string]string{"env": ""}, false},
+		{"too_many", func() map[string]string {
+			m := make(map[string]string, config.MaxLabels+1)
+			for i := range config.MaxLabels + 1 {
+				m[fmt.Sprintf("k%d", i)] = "v"
+			}
+			return m
+		}(), true},
+		{"key_uppercase", map[string]string{"Env": "prod"}, true},
+		{"key_starts_with_dash", map[string]string{"-env": "prod"}, true},
+		{"key_empty", map[string]string{"": "prod"}, true},
+		{"key_too_long", map[string]string{strings.Repeat("a", 64): "v"}, true},
+		{"value_has_slash", map[string]string{"env": "a/b"}, true},
+		{"value_has_comma", map[string]string{"env": "a,b"}, true},
+		{"value_has_space", map[string]string{"env": "a b"}, true},
+		{"value_too_long", map[string]string{"env": strings.Repeat("x", 129)}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := config.ValidateLabels(tt.labels)
+			if !tt.wantErr {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			var ve *config.ValidationError
+			require.ErrorAs(t, err, &ve)
+		})
+	}
+}
+
+func TestRequireImmutableLabels(t *testing.T) {
+	keys := []string{"created-by"}
+
+	assert.NoError(t, requireImmutableLabels(keys, map[string]string{"created-by": "csi"}))
+	assert.NoError(t, requireImmutableLabels(keys, map[string]string{"created-by": "cli", "extra": "ok"}))
+	requireStorageError(t, requireImmutableLabels(keys, map[string]string{"extra": "ok"}), ErrInvalid)
+	requireStorageError(t, requireImmutableLabels(keys, map[string]string{}), ErrInvalid)
+	requireStorageError(t, requireImmutableLabels(keys, nil), ErrInvalid)
+	assert.NoError(t, requireImmutableLabels(nil, nil), "nil keys = no requirements")
+}
+
+func TestProtectImmutableLabels(t *testing.T) {
+	keys := []string{"created-by"}
+
+	t.Run("preserves_on_omit", func(t *testing.T) {
+		updated := map[string]string{"env": "prod"}
+		require.NoError(t, protectImmutableLabels(keys, map[string]string{"created-by": "csi"}, updated))
+		assert.Equal(t, "csi", updated["created-by"], "should be preserved")
+	})
+
+	t.Run("rejects_change", func(t *testing.T) {
+		updated := map[string]string{"created-by": "hacker"}
+		err := protectImmutableLabels(keys, map[string]string{"created-by": "csi"}, updated)
+		requireStorageError(t, err, ErrInvalid)
+	})
+
+	t.Run("allows_same_value", func(t *testing.T) {
+		updated := map[string]string{"created-by": "csi", "env": "prod"}
+		require.NoError(t, protectImmutableLabels(keys, map[string]string{"created-by": "csi"}, updated))
+	})
+
+	t.Run("rejects_clone_source_change", func(t *testing.T) {
+		cur := map[string]string{"created-by": "k8s", "clone.source.type": "snapshot", "clone.source.name": "snap-1"}
+		updated := map[string]string{"clone.source.type": "volume"}
+		err := protectImmutableLabels(keys, cur, updated)
+		requireStorageError(t, err, ErrInvalid)
+	})
+
+	t.Run("preserves_clone_source_on_omit", func(t *testing.T) {
+		cur := map[string]string{"created-by": "k8s", "clone.source.type": "snapshot", "clone.source.name": "snap-1"}
+		updated := map[string]string{"env": "prod"}
+		require.NoError(t, protectImmutableLabels(keys, cur, updated))
+		assert.Equal(t, "snapshot", updated["clone.source.type"])
+		assert.Equal(t, "snap-1", updated["clone.source.name"])
+		assert.Equal(t, "k8s", updated["created-by"])
+	})
+
+	t.Run("allows_setting_when_previously_empty", func(t *testing.T) {
+		cur := map[string]string{}
+		updated := map[string]string{"created-by": "k8s"}
+		require.NoError(t, protectImmutableLabels(keys, cur, updated))
+		assert.Equal(t, "k8s", updated["created-by"])
+	})
+
+	t.Run("rejects_adding_clone_source_to_non_clone", func(t *testing.T) {
+		cur := map[string]string{"created-by": "k8s"}
+		updated := map[string]string{"clone.source.type": "snapshot"}
+		err := protectImmutableLabels(keys, cur, updated)
+		requireStorageError(t, err, ErrInvalid)
+	})
 }
 
 func TestFileMode(t *testing.T) {

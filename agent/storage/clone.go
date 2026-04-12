@@ -4,63 +4,112 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/erikmagkekse/btrfs-nfs-csi/config"
-
 	"github.com/rs/zerolog/log"
 )
 
-func (s *Storage) CreateClone(ctx context.Context, tenant string, req CloneCreateRequest) (*CloneMetadata, error) {
-	bp, err := s.tenantPath(tenant)
-	if err != nil {
+func (s *Storage) CreateClone(ctx context.Context, tenant string, req CloneCreateRequest) (*VolumeMetadata, error) {
+	if _, err := s.tenantPath(tenant); err != nil {
 		return nil, err
 	}
 
 	// validation
-	if err := validateName(req.Name); err != nil {
+	if err := config.ValidateName(req.Name); err != nil {
 		return nil, err
 	}
-	if err := validateName(req.Snapshot); err != nil {
+	if err := config.ValidateName(req.Snapshot); err != nil {
 		return nil, err
 	}
-	snapDir := filepath.Join(bp, config.SnapshotsDir, req.Snapshot)
-	srcData := filepath.Join(snapDir, config.DataDir)
-	if _, err := os.Stat(srcData); os.IsNotExist(err) {
+	labels := req.Labels
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[config.LabelCloneSourceType] = "snapshot"
+	labels[config.LabelCloneSourceName] = req.Snapshot
+	if err := config.ValidateLabels(labels); err != nil {
+		return nil, err
+	}
+	if err := requireImmutableLabels(s.immutableLabelKeys, labels); err != nil {
+		return nil, err
+	}
+	srcData := s.snapshots.DataPath(tenant, req.Snapshot)
+	snap, snapErr := s.snapshots.Get(tenant, req.Snapshot)
+	if snapErr != nil {
 		return nil, &StorageError{Code: ErrNotFound, Message: fmt.Sprintf("source snapshot %q not found", req.Snapshot)}
 	}
-	cloneDir := filepath.Join(bp, req.Name)
-	if _, err := os.Stat(cloneDir); err == nil {
-		var existing CloneMetadata
-		if err := ReadMetadata(filepath.Join(cloneDir, config.MetadataFile), &existing); err != nil {
-			return nil, fmt.Errorf("clone %q exists but metadata is corrupt: %w", req.Name, err)
+	srcVol, volErr := s.volumes.Get(tenant, snap.Volume)
+	if volErr != nil {
+		// Source volume was deleted. Fall back to snapshot properties.
+		srcVol = &VolumeMetadata{
+			SizeBytes:   snap.SizeBytes,
+			QuotaBytes:  snap.QuotaBytes,
+			NoCOW:       snap.NoCOW,
+			Compression: snap.Compression,
+			UID:         snap.UID,
+			GID:         snap.GID,
+			Mode:        snap.Mode,
 		}
-		return &existing, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("clone %q already exists", req.Name)}
+	}
+	cloneDir := s.volumes.Dir(tenant, req.Name)
+
+	// Serialize concurrent creators of the same name (see CreateVolume).
+	unlock, err := s.volumes.Lock(ctx, tenant, req.Name)
+	if err != nil {
+		return nil, &StorageError{Code: ErrBusy, Message: fmt.Sprintf("lock contention for clone %q: %v", req.Name, err)}
+	}
+	defer unlock()
+
+	if existing, err := s.volumes.Get(tenant, req.Name); err == nil {
+		return existing, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("clone %q already exists", req.Name)}
 	}
 
 	// operations
 	if err := os.MkdirAll(cloneDir, s.defaultDirMode); err != nil {
 		log.Error().Err(err).Msg("failed to create clone directory")
-		return nil, fmt.Errorf("failed to create clone directory: %w", err)
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("failed to create clone directory: %v", err)}
 	}
 
-	dstData := filepath.Join(cloneDir, config.DataDir)
+	dstData := s.volumes.DataPath(tenant, req.Name)
 	if err := s.btrfs.SubvolumeSnapshot(ctx, srcData, dstData, false); err != nil {
+		if isSubvolumeAlreadyExistsError(err) {
+			log.Warn().Err(err).Str("path", dstData).Msg("clone target already exists on disk")
+			return nil, &StorageError{Code: ErrAlreadyExists, Message: fmt.Sprintf("clone %q already exists on disk", req.Name)}
+		}
 		_ = os.RemoveAll(cloneDir)
 		log.Error().Err(err).Msg("failed to create clone")
-		return nil, fmt.Errorf("btrfs snapshot failed: %w", err)
+		return nil, &StorageError{Code: ErrInternal, Message: fmt.Sprintf("btrfs snapshot failed: %v", err)}
+	}
+
+	if s.quotaEnabled && srcVol.QuotaBytes > 0 {
+		if err := s.btrfs.QgroupLimit(ctx, dstData, srcVol.QuotaBytes); err != nil {
+			log.Error().Err(err).Str("path", dstData).Msg("failed to set qgroup limit on clone")
+			if delErr := s.btrfs.SubvolumeDelete(ctx, dstData); delErr != nil {
+				log.Warn().Err(delErr).Str("path", dstData).Msg("cleanup: failed to delete subvolume")
+			}
+			_ = os.RemoveAll(cloneDir)
+			return nil, fmt.Errorf("qgroup limit failed: %w", err)
+		}
 	}
 
 	now := time.Now().UTC()
-	meta := CloneMetadata{
-		Name:           req.Name,
-		SourceSnapshot: req.Snapshot,
-		Path:           cloneDir,
-		CreatedAt:      now,
+	vol := VolumeMetadata{
+		Name:        req.Name,
+		Path:        cloneDir,
+		SizeBytes:   srcVol.SizeBytes,
+		QuotaBytes:  srcVol.QuotaBytes,
+		Compression: srcVol.Compression,
+		NoCOW:       srcVol.NoCOW,
+		UID:         srcVol.UID,
+		GID:         srcVol.GID,
+		Mode:        srcVol.Mode,
+		Labels:      labels,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
-	if err := writeMetadataAtomic(filepath.Join(cloneDir, config.MetadataFile), meta); err != nil {
+	if err := s.volumes.Store(tenant, req.Name, &vol); err != nil {
 		log.Error().Err(err).Msg("failed to write clone metadata")
 		if delErr := s.btrfs.SubvolumeDelete(ctx, dstData); delErr != nil {
 			log.Warn().Err(delErr).Str("path", dstData).Msg("cleanup: failed to delete subvolume")
@@ -70,5 +119,5 @@ func (s *Storage) CreateClone(ctx context.Context, tenant string, req CloneCreat
 	}
 
 	log.Info().Str("tenant", tenant).Str("name", req.Name).Str("snapshot", req.Snapshot).Msg("clone created")
-	return &meta, nil
+	return &vol, nil
 }

@@ -58,6 +58,8 @@ spec:
           image: {{ include "btrfs-nfs-csi.driverImage" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - integration
+            - kubernetes
             - controller
           {{- with .Values.controller.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -166,6 +168,7 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --leader-election
+            - --extra-create-metadata
           {{- with $sc.snapshotter.extraArgs }}
             {{- toYaml . | nindent 12 }}
           {{- end }}

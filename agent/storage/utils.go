@@ -2,17 +2,24 @@ package storage
 
 import (
 	"fmt"
+	"net"
 	"os"
-	"regexp"
+	"strings"
+
+	"github.com/erikmagkekse/btrfs-nfs-csi/config"
 )
 
 // --- Error types ---
 
 const (
+	ErrBadRequest    = "BAD_REQUEST"
+	ErrUnauthorized  = "UNAUTHORIZED"
 	ErrInvalid       = "INVALID"
 	ErrNotFound      = "NOT_FOUND"
 	ErrAlreadyExists = "ALREADY_EXISTS"
 	ErrBusy          = "BUSY"
+	ErrMetadata      = "METADATA_ERROR"
+	ErrInternal      = "INTERNAL_ERROR"
 )
 
 type StorageError struct {
@@ -22,13 +29,58 @@ type StorageError struct {
 
 func (e *StorageError) Error() string { return e.Message }
 
-// --- Validation ---
+// isSubvolumeAlreadyExistsError reports whether a btrfs subvolume create or
+// snapshot error indicates that the target path already exists. The btrfs CLI
+// does not expose a stable error code, so we match on its stderr string.
+// Used by Create paths as defense-in-depth: the per-name lock should prevent
+// concurrent creators from racing here, but stale on-disk state left over
+// from a crashed previous run can still cause EEXIST, and we want to return
+// 409 ALREADY_EXISTS in that case, not 500 INTERNAL_ERROR.
+func isSubvolumeAlreadyExistsError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "target path already exists")
+}
 
-var validName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+func requireImmutableLabels(keys []string, labels map[string]string) error {
+	for _, k := range keys {
+		if labels[k] == "" {
+			return &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("label %q is required", k)}
+		}
+	}
+	return nil
+}
 
-func validateName(name string) error {
-	if !validName.MatchString(name) {
-		return &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("invalid name: %q (must be 1-128 chars, only a-z A-Z 0-9 _ -)", name)}
+func protectImmutableLabels(keys []string, cur, updated map[string]string) error {
+	// Protect explicitly configured immutable keys and soft-reserved keys
+	// (clone.source.*, created-by). Soft-reserved labels are set automatically
+	// on create and must not be changed or added via update.
+	allKeys := make(map[string]struct{}, len(keys)+len(config.SoftReservedLabelKeys))
+	for _, k := range keys {
+		allKeys[k] = struct{}{}
+	}
+	for _, k := range config.SoftReservedLabelKeys {
+		allKeys[k] = struct{}{}
+	}
+	for k := range allKeys {
+		if v, ok := updated[k]; ok && v != cur[k] {
+			// Allow initial set of created-by on volumes migrated from older versions.
+			// TODO: remove in future release once all pre-0.10.0 volumes have been backfilled.
+			if k == config.LabelCreatedBy && cur[k] == "" {
+				continue
+			}
+			return &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("label %q cannot be changed", k)}
+		}
+		if v := cur[k]; v != "" {
+			updated[k] = v
+		}
+	}
+	return nil
+}
+
+// validateClientIP ensures client is a valid IPv4 or IPv6 address.
+// Rejects wildcards, hostnames, CIDRs, and strings with unsafe characters.
+func validateClientIP(client string) error {
+	if net.ParseIP(client) == nil {
+		return &StorageError{Code: ErrInvalid, Message: fmt.Sprintf("invalid client IP: %q (must be a valid IPv4 or IPv6 address)", client)}
 	}
 	return nil
 }
@@ -65,4 +117,25 @@ func unixMode(m os.FileMode) uint64 {
 		mode |= 0o1000
 	}
 	return mode
+}
+
+var defaultImmutableLabelKeys = []string{config.LabelCreatedBy}
+
+func ImmutableLabelKeys(extra string) []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, k := range defaultImmutableLabelKeys {
+		if !seen[k] {
+			keys = append(keys, k)
+			seen[k] = true
+		}
+	}
+	for k := range strings.SplitSeq(extra, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" && !seen[k] {
+			keys = append(keys, k)
+			seen[k] = true
+		}
+	}
+	return keys
 }

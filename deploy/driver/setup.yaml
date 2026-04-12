@@ -147,9 +147,9 @@ spec:
           effect: NoSchedule
       containers:
         - name: csi-driver
-          image: ghcr.io/erikmagkekse/btrfs-nfs-csi:0.9.11
+          image: ghcr.io/erikmagkekse/btrfs-nfs-csi:0.10.0
           imagePullPolicy: Always
-          args: ["controller"]
+          args: ["integration", "kubernetes", "controller"]
           env:
             - name: DRIVER_ENDPOINT
               value: unix:///csi/csi.sock
@@ -204,6 +204,7 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --leader-election
+            - --extra-create-metadata
           resources:
             requests:
               cpu: 10m
@@ -281,13 +282,14 @@ spec:
           effect: NoExecute
         - operator: Exists
           effect: NoSchedule
-      # Uncomment if using DRIVER_STORAGE_INTERFACE or DRIVER_STORAGE_CIDR
-      #hostNetwork: true
+      # hostNetwork is recommended: NFS4 sessions survive driver pod restarts.
+      # Required when using DRIVER_STORAGE_INTERFACE or DRIVER_STORAGE_CIDR.
+      hostNetwork: true
       containers:
         - name: csi-driver
-          image: ghcr.io/erikmagkekse/btrfs-nfs-csi:0.9.11
+          image: ghcr.io/erikmagkekse/btrfs-nfs-csi:0.10.0
           imagePullPolicy: Always
-          args: ["driver"]
+          args: ["integration", "kubernetes", "driver"]
           securityContext:
             privileged: true
           env:
