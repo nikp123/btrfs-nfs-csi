@@ -15,5 +15,5 @@ in buildGoModule {
 
   subPackages = [ "cmd/btrfs-nfs-csi" ];
 
-  vendorHash = "sha256-GNFs41CTND7fkBkrVnGb7nVcIUPRMN+ipgTrqKCbgNw=";
+  vendorHash = "sha256-V0Wy6ss33a0p2ptMRLuaAnRzEe5OgWy2nSfJ0xShhLo=";
 }
